@@ -93,6 +93,17 @@ FEATURES = [
 
 CATEGORICAL_FEATURES = ["player_position"]
 
+# Two-stage: after TR models are trained, their predictions at each output frame
+# become additional features for the DC models.
+DC_EXTRA_FEATURES = ["tr_x_pred", "tr_y_pred", "dist_to_tr_pred", "dx_to_tr_pred", "dy_to_tr_pred"]
+
+
+def _get_features(role: str) -> list[str]:
+    """Feature list per role. DC gets TR-prediction features on top of the base set."""
+    if role == "Defensive Coverage":
+        return FEATURES + DC_EXTRA_FEATURES
+    return FEATURES
+
 
 # ---------------------------------------------------------------------------
 # Normalization
@@ -407,81 +418,139 @@ def tune_hyperparams(df: pd.DataFrame) -> dict[str, dict]:
     return best_per_role
 
 
-def train_models(df: pd.DataFrame, params_per_role: dict[str, dict] | None = None) -> dict:
-    """Train 4 LightGBM models with early stopping, using per-role hyperparameters.
+def _add_tr_predictions(df: pd.DataFrame, tr_models: dict) -> pd.DataFrame:
+    """Run TR models on the TR rows in df, then merge those predictions onto ALL rows.
 
-    params_per_role: {role: params_dict} from tune_hyperparams(). If None, uses
-    defaults (lr=0.05, leaves=63) for all roles.
+    Used during DC training so that DC sees where the TR is predicted to be at each
+    future frame.  The blend is applied to the TR predictions before merging so that
+    training-time features match what predict_with_models produces at inference.
+    """
+    tr_mask = df["player_role"] == "Targeted Receiver"
+    tr_df = df.loc[tr_mask].copy()
+    for col in CATEGORICAL_FEATURES:
+        tr_df[col] = tr_df[col].astype("category")
+
+    tr_df["tr_x_pred"] = tr_models[("Targeted Receiver", "x_actual")].predict(tr_df[FEATURES]).clip(0, 120)
+    tr_df["tr_y_pred"] = tr_models[("Targeted Receiver", "y_actual")].predict(tr_df[FEATURES]).clip(0, 53.33)
+
+    # Apply short-horizon blend to TR predictions (match inference behaviour)
+    for fid, w in BLEND_WEIGHTS.items():
+        mask = tr_df["frame_id"] == fid
+        tr_df.loc[mask, "tr_x_pred"] = w * tr_df.loc[mask, "tr_x_pred"] + (1 - w) * tr_df.loc[mask, "x_linear"]
+        tr_df.loc[mask, "tr_y_pred"] = w * tr_df.loc[mask, "tr_y_pred"] + (1 - w) * tr_df.loc[mask, "y_linear"]
+
+    # Merge TR predictions onto all rows keyed by (game_id, play_id, frame_id)
+    tr_preds = tr_df[["game_id", "play_id", "frame_id", "tr_x_pred", "tr_y_pred"]]
+    df = df.merge(tr_preds, on=["game_id", "play_id", "frame_id"], how="left")
+
+    df["dist_to_tr_pred"] = np.sqrt((df["x"] - df["tr_x_pred"]) ** 2 + (df["y"] - df["tr_y_pred"]) ** 2)
+    df["dx_to_tr_pred"] = df["tr_x_pred"] - df["x"]
+    df["dy_to_tr_pred"] = df["tr_y_pred"] - df["y"]
+    return df
+
+
+def train_models(df: pd.DataFrame, params_per_role: dict[str, dict] | None = None) -> dict:
+    """Two-stage training: TR first, then DC with TR predictions as extra features.
+
+    params_per_role: {role: params_dict} from tune_hyperparams(). If None, uses defaults.
     """
     defaults = {**LGBM_BASE_PARAMS, "learning_rate": 0.05, "num_leaves": 63}
 
-    # Use last 10% of game_ids as early-stopping val within the training set
     game_ids = sorted(df["game_id"].unique())
     n_es_val = max(1, int(len(game_ids) * 0.1))
     es_val_games = set(game_ids[-n_es_val:])
 
     models = {}
-    for role in ["Targeted Receiver", "Defensive Coverage"]:
-        params = (params_per_role or {}).get(role, defaults)
-        role_df = df[df["player_role"] == role].copy()
-        for col in CATEGORICAL_FEATURES:
-            role_df[col] = role_df[col].astype("category")
 
-        tr = role_df[~role_df["game_id"].isin(es_val_games)]
-        va = role_df[role_df["game_id"].isin(es_val_games)]
+    # --- Stage 1: Train TR ---
+    role = "Targeted Receiver"
+    params = (params_per_role or {}).get(role, defaults)
+    features = _get_features(role)
+    role_df = df[df["player_role"] == role].copy()
+    for col in CATEGORICAL_FEATURES:
+        role_df[col] = role_df[col].astype("category")
+    tr = role_df[~role_df["game_id"].isin(es_val_games)]
+    va = role_df[role_df["game_id"].isin(es_val_games)]
+    for target in ["x_actual", "y_actual"]:
+        model = _train_single(tr[features], tr[target], va[features], va[target], params)
+        models[(role, target)] = model
+        print(f"  {role} -> {target}: {model.best_iteration} rounds "
+              f"(train {len(tr):,} / es-val {len(va):,})")
 
-        for target in ["x_actual", "y_actual"]:
-            model = _train_single(
-                tr[FEATURES], tr[target],
-                va[FEATURES], va[target],
-                params,
-            )
-            models[(role, target)] = model
-            print(f"  {role} -> {target}: {model.best_iteration} rounds "
-                  f"(train {len(tr):,} / es-val {len(va):,})")
+    # --- Stage 1.5: Generate in-sample TR predictions as DC features ---
+    print("  Generating TR predictions for DC stacking...")
+    df = _add_tr_predictions(df, models)
+
+    # --- Stage 2: Train DC with extended feature set ---
+    role = "Defensive Coverage"
+    params = (params_per_role or {}).get(role, defaults)
+    features = _get_features(role)
+    role_df = df[df["player_role"] == role].copy()
+    for col in CATEGORICAL_FEATURES:
+        role_df[col] = role_df[col].astype("category")
+    tr = role_df[~role_df["game_id"].isin(es_val_games)]
+    va = role_df[role_df["game_id"].isin(es_val_games)]
+    for target in ["x_actual", "y_actual"]:
+        model = _train_single(tr[features], tr[target], va[features], va[target], params)
+        models[(role, target)] = model
+        print(f"  {role} -> {target}: {model.best_iteration} rounds "
+              f"(train {len(tr):,} / es-val {len(va):,})")
+
     return models
 
 
 def predict_with_models(models: dict, df: pd.DataFrame) -> pd.DataFrame:
+    """Two-stage prediction with short-horizon blend inlined.
+
+    TR is predicted first, blended, then its predictions are merged onto DC rows
+    as features before DC is predicted and blended.
+    """
     df = df.copy()
     df["x_pred"] = np.nan
     df["y_pred"] = np.nan
-    for role in ["Targeted Receiver", "Defensive Coverage"]:
-        mask = df["player_role"] == role
-        if mask.sum() == 0:
-            continue
-        role_df = df.loc[mask].copy()
+
+    # --- Stage 1: Predict & blend TR ---
+    tr_mask = df["player_role"] == "Targeted Receiver"
+    if tr_mask.sum() > 0:
+        tr_df = df.loc[tr_mask].copy()
         for col in CATEGORICAL_FEATURES:
-            role_df[col] = role_df[col].astype("category")
-        X = role_df[FEATURES]
-        df.loc[mask, "x_pred"] = models[(role, "x_actual")].predict(X)
-        df.loc[mask, "y_pred"] = models[(role, "y_actual")].predict(X)
+            tr_df[col] = tr_df[col].astype("category")
+        features = _get_features("Targeted Receiver")
+        df.loc[tr_mask, "x_pred"] = models[("Targeted Receiver", "x_actual")].predict(tr_df[features])
+        df.loc[tr_mask, "y_pred"] = models[("Targeted Receiver", "y_actual")].predict(tr_df[features])
+        for fid, w in BLEND_WEIGHTS.items():
+            mask = tr_mask & (df["frame_id"] == fid)
+            df.loc[mask, "x_pred"] = w * df.loc[mask, "x_pred"] + (1 - w) * df.loc[mask, "x_linear"]
+            df.loc[mask, "y_pred"] = w * df.loc[mask, "y_pred"] + (1 - w) * df.loc[mask, "y_linear"]
+
+    # --- Stage 2: Predict & blend DC (using TR predictions as features) ---
+    dc_mask = df["player_role"] == "Defensive Coverage"
+    if dc_mask.sum() > 0:
+        # Merge blended TR predictions onto DC rows
+        tr_preds = df.loc[tr_mask, ["game_id", "play_id", "frame_id", "x_pred", "y_pred"]].rename(
+            columns={"x_pred": "tr_x_pred", "y_pred": "tr_y_pred"}
+        )
+        dc_df = df.loc[dc_mask].merge(tr_preds, on=["game_id", "play_id", "frame_id"], how="left")
+        dc_df["dist_to_tr_pred"] = np.sqrt(
+            (dc_df["x"] - dc_df["tr_x_pred"]) ** 2 + (dc_df["y"] - dc_df["tr_y_pred"]) ** 2
+        )
+        dc_df["dx_to_tr_pred"] = dc_df["tr_x_pred"] - dc_df["x"]
+        dc_df["dy_to_tr_pred"] = dc_df["tr_y_pred"] - dc_df["y"]
+
+        for col in CATEGORICAL_FEATURES:
+            dc_df[col] = dc_df[col].astype("category")
+        features = _get_features("Defensive Coverage")
+        df.loc[dc_mask, "x_pred"] = models[("Defensive Coverage", "x_actual")].predict(dc_df[features])
+        df.loc[dc_mask, "y_pred"] = models[("Defensive Coverage", "y_actual")].predict(dc_df[features])
+        for fid, w in BLEND_WEIGHTS.items():
+            mask = dc_mask & (df["frame_id"] == fid)
+            df.loc[mask, "x_pred"] = w * df.loc[mask, "x_pred"] + (1 - w) * df.loc[mask, "x_linear"]
+            df.loc[mask, "y_pred"] = w * df.loc[mask, "y_pred"] + (1 - w) * df.loc[mask, "y_linear"]
+
     df["x_pred"] = df["x_pred"].clip(0, 120)
     df["y_pred"] = df["y_pred"].clip(0, 53.33)
     return df
 
-
-def _apply_blend(df: pd.DataFrame) -> pd.DataFrame:
-    """Post-processing: blend linear baseline into model predictions at short horizons.
-
-    The model optimizes for the full sequence and tends to overshoot at frames 1-3.
-    Linear extrapolation is more accurate there because the player hasn't had time
-    to change course yet. BLEND_WEIGHTS controls the interpolation per frame_id.
-    """
-    df = df.copy()
-    for fid, model_weight in BLEND_WEIGHTS.items():
-        mask = df["frame_id"] == fid
-        if mask.sum() == 0:
-            continue
-        df.loc[mask, "x_pred"] = (
-            model_weight * df.loc[mask, "x_pred"]
-            + (1 - model_weight) * df.loc[mask, "x_linear"]
-        )
-        df.loc[mask, "y_pred"] = (
-            model_weight * df.loc[mask, "y_pred"]
-            + (1 - model_weight) * df.loc[mask, "y_linear"]
-        )
-    return df
 
 
 def evaluate(df: pd.DataFrame, models: dict) -> None:
@@ -521,14 +590,20 @@ def evaluate(df: pd.DataFrame, models: dict) -> None:
         l = np.sqrt(df.loc[mask, "err_sq_linear"].mean())
         print(f"  {fid:<3} ({fid * 0.1:.1f}s)  {m:>8.4f} {l:>8.4f}")
 
-    # Feature importance (averaged across all 4 models)
-    print(f"\nTop 15 features by importance (avg gain across models):")
-    imp = pd.Series(0.0, index=FEATURES)
-    for model in models.values():
-        imp += pd.Series(model.feature_importance(importance_type="gain"), index=FEATURES)
-    imp /= len(models)
-    for feat, val in imp.sort_values(ascending=False).head(15).items():
-        print(f"  {feat:<30} {val:>12.1f}")
+    # Feature importance per role (feature lists differ between TR and DC)
+    print(f"\nTop 10 features by importance (avg gain over x/y, per role):")
+    for role in ["Targeted Receiver", "Defensive Coverage"]:
+        features = _get_features(role)
+        imp = pd.Series(0.0, index=features)
+        for target in ["x_actual", "y_actual"]:
+            imp += pd.Series(
+                models[(role, target)].feature_importance(importance_type="gain"),
+                index=features,
+            )
+        imp /= 2
+        print(f"\n  {role}:")
+        for feat, val in imp.sort_values(ascending=False).head(10).items():
+            print(f"    {feat:<30} {val:>12.1f}")
 
 
 # ---------------------------------------------------------------------------
@@ -569,9 +644,8 @@ def generate_test_predictions(models: dict) -> pd.DataFrame:
     df = df.merge(context, on=["game_id", "play_id", "nfl_id"])
     df = _engineer_features(df)
 
-    # Predict in normalized coordinates, then blend short-horizon frames
+    # Predict in normalized coordinates (blend is applied inside predict_with_models)
     df = predict_with_models(models, df)
-    df = _apply_blend(df)
 
     # Un-normalize x for left-direction plays
     df = df.merge(dir_map, on=["game_id", "play_id"])
@@ -614,7 +688,6 @@ def main():
 
         print("\nEvaluating on validation set...")
         val_df = predict_with_models(models, val_df)
-        val_df = _apply_blend(val_df)
         evaluate(val_df, models)
 
     if not args.train_only:
