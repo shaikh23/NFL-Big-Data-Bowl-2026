@@ -64,10 +64,21 @@ Key findings:
 - The model is worse than linear at very short horizons (frames 1–3, < 0.3s). At those timescales the player has barely moved and straight-line projection is nearly exact. Not worth special-casing for now.
 - Error still grows with horizon but much more slowly than linear: 1.21 yards at 1s vs 2.06 for linear; 3.09 at 2s vs 5.32.
 
-### 3. Gradient boosting with physics-informed features
-Flatten the sequence prediction: for each (player, output_frame), predict x and y as independent regression targets. Key engineered features: distance/angle to ball landing spot, relative speed needed to reach ball in available time, full pre-throw trajectory summary. Use XGBoost or LightGBM. Combine with approach 2 (one model per role).
+### 3. Gradient boosting with trajectory and contextual features
+Builds on Approach 2. Adds two feature categories: (a) trajectory summaries from the last 10 input frames (speed trend, direction stability, smoothed velocity), and (b) contextual features encoding spatial relationships between players on the same play (distance/relative velocity to targeted receiver, geometry relative to the TR-to-ball line, defender pressure on the receiver).
 
-**Status:** pending
+**Status:** done — `scripts/model_per_role_v2.py`
+
+Results (LightGBM, weeks 1–14 train / 15–18 val):
+- Overall RMSE: **1.24 yards** vs v1's 1.45 (15% improvement over v1, 49% over linear)
+- Targeted Receiver: 0.79 vs v1's 0.90
+- Defensive Coverage: 1.37 vs v1's 1.62 (defenders improved more — contextual features are most relevant here)
+
+Key findings:
+- Defenders benefited most from the new features. Knowing where the TR is and the geometry of the TR-to-ball line helps predict how defenders react.
+- `y_vel_smooth` (trajectory) enters the top-15 feature importance — the pre-throw trajectory is contributing, particularly for y-direction prediction.
+- The contextual features don't dominate individual importance rankings but are clearly driving the defender improvement.
+- Short-horizon overshoot improved (0.28 at frame 1, down from 0.38 in v1) but still above linear's 0.03.
 
 ### 4. Physics-informed feature engineering
 Engineer features that encode the relationship between each player and the ball landing location: distance, angle relative to current direction of motion, time-to-arrival given current speed, etc. These are especially high-signal for the targeted receiver. Feed these into whatever model is in use.
