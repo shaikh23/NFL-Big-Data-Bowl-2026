@@ -1,0 +1,28 @@
+# Data (large files, lives on external drive or local only)
+data/
+
+# Python
+__pycache__/
+*.py[oc]
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model artifacts
+*.h5
+*.pkl
+*.pth
+*.pt
+*.onnx
+
+# Generated predictions
+test_predictions_*.csv
+
+# Logs
+*.log
+logs/

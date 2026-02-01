@@ -1,0 +1,18 @@
+[project]
+name = "nfl-big-data-bowl"
+version = "0.1.0"
+description = "NFL Big Data Bowl 2026 - Prediction Competition"
+requires-python = ">=3.12"
+dependencies = [
+    "catboost>=1.2.8",
+    "grpcio>=1.70.0",
+    "jupyter>=1.1.1",
+    "lightgbm>=4.6.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.1",
+    "pandas>=3.0.0",
+    "polars>=1.0.0",
+    "scikit-learn>=1.8.0",
+    "scipy>=1.14.0",
+    "xgboost>=3.1.3",
+]
