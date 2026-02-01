@@ -40,17 +40,23 @@ from config import TRAIN_DIR, TEST_INPUT, TEST_CSV
 TRAIN_WEEKS = list(range(1, 15))
 VAL_WEEKS = list(range(15, 19))
 
-LGBM_PARAMS = {
+LGBM_BASE_PARAMS = {
     "objective": "regression",
     "metric": "rmse",
-    "learning_rate": 0.05,
-    "num_leaves": 63,
     "min_child_samples": 50,
     "feature_fraction": 0.8,
     "bagging_fraction": 0.8,
     "bagging_freq": 5,
     "verbose": -1,
 }
+
+# Grid search space — evaluated on train/val split, best params reused for full retrain
+LR_GRID = [0.02, 0.05, 0.1]
+LEAVES_GRID = [31, 63, 127]
+
+# Short-horizon blend: linear wins at very early frames; blend smoothly
+# frame_id 1-2: pure linear, frame 3: 50% blend, frame 4+: pure model
+BLEND_WEIGHTS = {1: 0.0, 2: 0.0, 3: 0.5}  # weight on MODEL prediction
 
 FEATURES = [
     # --- v1 features ---
@@ -334,19 +340,105 @@ def load_weeks(weeks: list[int]) -> pd.DataFrame:
 # Model training, prediction, evaluation
 # ---------------------------------------------------------------------------
 
-def train_models(df: pd.DataFrame) -> dict:
+def _train_single(X_train, y_train, X_val, y_val, params: dict, max_rounds: int = 5000) -> lgb.Booster:
+    """Train one LightGBM model with early stopping on a validation set."""
+    train_ds = lgb.Dataset(X_train, label=y_train, categorical_feature=CATEGORICAL_FEATURES)
+    val_ds = lgb.Dataset(X_val, label=y_val, categorical_feature=CATEGORICAL_FEATURES, reference=train_ds)
+    model = lgb.train(
+        params, train_ds,
+        num_boost_round=max_rounds,
+        valid_sets=[val_ds],
+        callbacks=[lgb.early_stopping(100, verbose=False), lgb.log_evaluation(0)],
+    )
+    return model
+
+
+def tune_hyperparams(df: pd.DataFrame) -> dict[str, dict]:
+    """Grid search over learning_rate x num_leaves, tuned independently per role.
+
+    Within df (already the train weeks 1-14), split the last 20% of game_ids
+    as an early-stopping validation set. Returns {role: best_params}.
+    """
+    game_ids = sorted(df["game_id"].unique())
+    n_tune_val = max(1, int(len(game_ids) * 0.2))
+    tune_val_games = set(game_ids[-n_tune_val:])
+
+    tune_train = df[~df["game_id"].isin(tune_val_games)]
+    tune_val = df[df["game_id"].isin(tune_val_games)]
+
+    print(f"  Tuning grid: {len(LR_GRID)} LRs x {len(LEAVES_GRID)} num_leaves "
+          f"| tune-train {len(tune_train):,} rows, tune-val {len(tune_val):,} rows")
+
+    best_per_role = {}
+    for role in ["Targeted Receiver", "Defensive Coverage"]:
+        best_rmse = float("inf")
+        best_params = {}
+        for lr in LR_GRID:
+            for leaves in LEAVES_GRID:
+                params = {**LGBM_BASE_PARAMS, "learning_rate": lr, "num_leaves": leaves}
+                role_rmses = []
+
+                for target in ["x_actual", "y_actual"]:
+                    tr = tune_train[tune_train["player_role"] == role].copy()
+                    va = tune_val[tune_val["player_role"] == role].copy()
+                    for col in CATEGORICAL_FEATURES:
+                        tr[col] = tr[col].astype("category")
+                        va[col] = va[col].astype("category")
+
+                    model = _train_single(
+                        tr[FEATURES], tr[target],
+                        va[FEATURES], va[target],
+                        params,
+                    )
+                    preds = model.predict(va[FEATURES])
+                    rmse = np.sqrt(((preds - va[target]) ** 2).mean())
+                    role_rmses.append(rmse)
+
+                avg_rmse = np.mean(role_rmses)
+                flag = " <-- best" if avg_rmse < best_rmse else ""
+                print(f"    {role[:2]} lr={lr:<5} leaves={leaves:<4} rmse={avg_rmse:.4f}{flag}")
+                if avg_rmse < best_rmse:
+                    best_rmse = avg_rmse
+                    best_params = params
+
+        best_per_role[role] = best_params
+        print(f"  {role}: lr={best_params['learning_rate']}, num_leaves={best_params['num_leaves']}, rmse={best_rmse:.4f}\n")
+
+    return best_per_role
+
+
+def train_models(df: pd.DataFrame, params_per_role: dict[str, dict] | None = None) -> dict:
+    """Train 4 LightGBM models with early stopping, using per-role hyperparameters.
+
+    params_per_role: {role: params_dict} from tune_hyperparams(). If None, uses
+    defaults (lr=0.05, leaves=63) for all roles.
+    """
+    defaults = {**LGBM_BASE_PARAMS, "learning_rate": 0.05, "num_leaves": 63}
+
+    # Use last 10% of game_ids as early-stopping val within the training set
+    game_ids = sorted(df["game_id"].unique())
+    n_es_val = max(1, int(len(game_ids) * 0.1))
+    es_val_games = set(game_ids[-n_es_val:])
+
     models = {}
     for role in ["Targeted Receiver", "Defensive Coverage"]:
+        params = (params_per_role or {}).get(role, defaults)
         role_df = df[df["player_role"] == role].copy()
         for col in CATEGORICAL_FEATURES:
             role_df[col] = role_df[col].astype("category")
-        X = role_df[FEATURES]
+
+        tr = role_df[~role_df["game_id"].isin(es_val_games)]
+        va = role_df[role_df["game_id"].isin(es_val_games)]
+
         for target in ["x_actual", "y_actual"]:
-            y = role_df[target]
-            dataset = lgb.Dataset(X, label=y, categorical_feature=CATEGORICAL_FEATURES)
-            model = lgb.train(LGBM_PARAMS, dataset, num_boost_round=500)
+            model = _train_single(
+                tr[FEATURES], tr[target],
+                va[FEATURES], va[target],
+                params,
+            )
             models[(role, target)] = model
-            print(f"  {role} -> {target}: trained ({len(role_df):,} rows)")
+            print(f"  {role} -> {target}: {model.best_iteration} rounds "
+                  f"(train {len(tr):,} / es-val {len(va):,})")
     return models
 
 
@@ -366,6 +458,29 @@ def predict_with_models(models: dict, df: pd.DataFrame) -> pd.DataFrame:
         df.loc[mask, "y_pred"] = models[(role, "y_actual")].predict(X)
     df["x_pred"] = df["x_pred"].clip(0, 120)
     df["y_pred"] = df["y_pred"].clip(0, 53.33)
+    return df
+
+
+def _apply_blend(df: pd.DataFrame) -> pd.DataFrame:
+    """Post-processing: blend linear baseline into model predictions at short horizons.
+
+    The model optimizes for the full sequence and tends to overshoot at frames 1-3.
+    Linear extrapolation is more accurate there because the player hasn't had time
+    to change course yet. BLEND_WEIGHTS controls the interpolation per frame_id.
+    """
+    df = df.copy()
+    for fid, model_weight in BLEND_WEIGHTS.items():
+        mask = df["frame_id"] == fid
+        if mask.sum() == 0:
+            continue
+        df.loc[mask, "x_pred"] = (
+            model_weight * df.loc[mask, "x_pred"]
+            + (1 - model_weight) * df.loc[mask, "x_linear"]
+        )
+        df.loc[mask, "y_pred"] = (
+            model_weight * df.loc[mask, "y_pred"]
+            + (1 - model_weight) * df.loc[mask, "y_linear"]
+        )
     return df
 
 
@@ -454,8 +569,9 @@ def generate_test_predictions(models: dict) -> pd.DataFrame:
     df = df.merge(context, on=["game_id", "play_id", "nfl_id"])
     df = _engineer_features(df)
 
-    # Predict in normalized coordinates
+    # Predict in normalized coordinates, then blend short-horizon frames
     df = predict_with_models(models, df)
+    df = _apply_blend(df)
 
     # Un-normalize x for left-direction plays
     df = df.merge(dir_map, on=["game_id", "play_id"])
@@ -479,6 +595,7 @@ def main():
     args = parser.parse_args()
 
     models = None
+    tuned_params = None
 
     if not args.test_only:
         print("Loading training data (weeks 1-14)...")
@@ -489,11 +606,15 @@ def main():
         val_df = load_weeks(VAL_WEEKS)
         print(f"  Total: {len(val_df):,} rows\n")
 
-        print("Training models...")
-        models = train_models(train_df)
+        print("Tuning hyperparameters (per role)...")
+        tuned_params = tune_hyperparams(train_df)
+
+        print("Training models with tuned params...")
+        models = train_models(train_df, tuned_params)
 
         print("\nEvaluating on validation set...")
         val_df = predict_with_models(models, val_df)
+        val_df = _apply_blend(val_df)
         evaluate(val_df, models)
 
     if not args.train_only:
@@ -501,8 +622,8 @@ def main():
         all_df = load_weeks(list(range(1, 19)))
         print(f"  Total: {len(all_df):,} rows\n")
 
-        print("Training models (full data)...")
-        models = train_models(all_df)
+        print("Training models (full data, tuned params)...")
+        models = train_models(all_df, tuned_params)
 
         print("\nGenerating test predictions...")
         preds = generate_test_predictions(models)

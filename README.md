@@ -69,16 +69,21 @@ Builds on Approach 2. Adds two feature categories: (a) trajectory summaries from
 
 **Status:** done — `scripts/model_per_role_v2.py`
 
-Results (LightGBM, weeks 1–14 train / 15–18 val):
-- Overall RMSE: **1.24 yards** vs v1's 1.45 (15% improvement over v1, 49% over linear)
-- Targeted Receiver: 0.79 vs v1's 0.90
-- Defensive Coverage: 1.37 vs v1's 1.62 (defenders improved more — contextual features are most relevant here)
+Results (LightGBM, weeks 1–14 train / 15–18 val, with per-role tuning + short-horizon blend):
+- Overall RMSE: **1.199 yards** vs v1's 1.45 (17% improvement over v1, 50.5% over linear)
+- Targeted Receiver: 0.769 vs v1's 0.90
+- Defensive Coverage: 1.332 vs v1's 1.62
+
+Tuning details:
+- Per-role grid search over learning_rate ∈ {0.02, 0.05, 0.1} and num_leaves ∈ {31, 63, 127}. Both roles converged on lr=0.02, num_leaves=31 (simpler, slower-learning trees).
+- Early stopping with patience=100, max 5000 rounds. TR models stop at ~3500-4100 rounds; DC at ~4700-5000.
+- Short-horizon blend: frames 1–2 use pure linear prediction, frame 3 is 50/50 linear+model, frame 4+ is pure model. Fixes the model's tendency to overshoot at very short horizons.
 
 Key findings:
 - Defenders benefited most from the new features. Knowing where the TR is and the geometry of the TR-to-ball line helps predict how defenders react.
 - `y_vel_smooth` (trajectory) enters the top-15 feature importance — the pre-throw trajectory is contributing, particularly for y-direction prediction.
 - The contextual features don't dominate individual importance rankings but are clearly driving the defender improvement.
-- Short-horizon overshoot improved (0.28 at frame 1, down from 0.38 in v1) but still above linear's 0.03.
+- Tuning + blend together add ~3.3% over the untuned v2 baseline (1.24 → 1.199).
 
 ### 4. Physics-informed feature engineering
 Engineer features that encode the relationship between each player and the ball landing location: distance, angle relative to current direction of motion, time-to-arrival given current speed, etc. These are especially high-signal for the targeted receiver. Feed these into whatever model is in use.
