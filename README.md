@@ -85,12 +85,43 @@ Key findings:
 - The contextual features don't dominate individual importance rankings but are clearly driving the defender improvement.
 - Tuning + blend together add ~3.3% over the untuned v2 baseline (1.24 → 1.199).
 
-### 4. Physics-informed feature engineering
-Engineer features that encode the relationship between each player and the ball landing location: distance, angle relative to current direction of motion, time-to-arrival given current speed, etc. These are especially high-signal for the targeted receiver. Feed these into whatever model is in use.
+### 4. Two-stage prediction (TR predictions → DC features)
+Train TR models first, then feed their per-frame predicted positions into the DC model as additional features (`tr_x_pred`, `tr_y_pred`, `dist_to_tr_pred`, `dx_to_tr_pred`, `dy_to_tr_pred`). The idea: defenders react to where the receiver is *going*, not just where they were at throw time.
 
-**Status:** pending
+**Status:** done — integrated into `scripts/model_per_role_v2.py`
 
-### 5. Sequence models (LSTM / Transformer)
-Input is a time series, output is a time series. A small LSTM or Transformer could learn temporal movement patterns that flat features miss. Higher engineering cost, may not beat well-tuned gradient boosting on this dataset size. Stretch goal.
+Results (val set):
+- DC RMSE: **1.335** vs 1.332 without stacking — essentially flat.
+- `tr_x_pred` ranks 4th in DC feature importance (108M avg gain), so the model does use it.
 
-**Status:** pending
+Key findings:
+- The throw-time contextual features (`dist_to_tr`, `dx_to_tr`, relative velocity) already capture most of what the DC model needs. The predicted future TR position adds marginal signal on top.
+- In-sample TR predictions during DC training introduce a slight optimism bias (TR was trained on the same data). Cross-validated TR predictions could close this gap but the marginal benefit doesn't justify the added complexity.
+- This is a clean null result at this margin. The stacking infrastructure is in place if the TR model improves significantly in the future.
+
+### 5. Sequence models (LSTM)
+2-layer LSTM encoder over the last 10 input frames, with a per-output-frame MLP decoder. The encoder learns a hidden representation of the player's pre-throw trajectory; the decoder combines it with per-frame physics features (linear baseline, dist-to-ball, etc.) to predict (x, y). Trained separately per role.
+
+**Status:** done — `scripts/model_lstm.py`
+
+Results (val set, 50 epochs, no short-horizon blend):
+- Overall RMSE: **1.670 yards** vs v2's 1.199 — not competitive.
+- Targeted Receiver: 1.486 vs v2's 0.769
+- Defensive Coverage: 1.738 vs v2's 1.335
+- Beats linear starting at frame 6 (0.77 vs 0.80 yards), but is catastrophically worse at frames 1–5 (1.04 at frame 1 vs linear's 0.03).
+
+Key findings:
+- The LSTM does not learn to leverage the linear baseline features (`x_linear`, `y_linear`) effectively, despite them being in its input. LightGBM picks this up immediately and treats them as the dominant correction target.
+- Both models were still improving at epoch 50 (DC never triggered early stopping), so more training would help at the margin — but the gap to v2 is too large to close with epochs alone.
+- The short-horizon failure is severe: at very short horizons the player hasn't changed course yet, so linear extrapolation is nearly exact. The LSTM predicts some learned "average" trajectory instead.
+- Verdict: on this dataset, well-engineered gradient boosting with physics-informed features dominates a vanilla LSTM. A sequence model could potentially compete with a skip-connection architecture (direct residual on the linear baseline) or attention, but that's beyond the scope here.
+
+### Summary table (val set, weeks 15–18)
+
+| Approach | Overall | TR | DC | Notes |
+|---|---|---|---|---|
+| Linear baseline | 2.41 | 1.99 | 2.56 | Physics extrapolation |
+| Per-role LightGBM v1 | 1.45 | 0.90 | 1.62 | + physics features |
+| Per-role LightGBM v2 | 1.199 | 0.769 | 1.335 | + trajectory, context, tuning, blend |
+| v2 + two-stage stacking | 1.202 | 0.769 | 1.335 | TR preds → DC (null) |
+| LSTM | 1.670 | 1.486 | 1.738 | Sequence model |
